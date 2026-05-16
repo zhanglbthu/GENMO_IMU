@@ -25,12 +25,6 @@ from gem.utils.geo_transform import get_bbx_xys, normalize_kp2d
 from gem.utils.net_utils import length_to_mask
 from gem.utils.postprocess import pp_static_joint, process_ik
 from gem.utils.pylogger import Log
-from gem.utils.smpl_augment import (
-    get_invisible_legs_mask,
-    get_visible_mask,
-    get_wham_aug_kp3d,
-    randomly_modify_hands_legs,
-)
 from gem.utils.smplx_utils import make_smplx
 from gem.utils.tools import Timer
 
@@ -411,6 +405,16 @@ class GEM(pl.LightningModule):
         return outputs
 
     def prepare_batch(self, batch, mode):
+        # Training-time observation augmentation depends on external resources
+        # that are not needed for demo/inference-only workflows. Import lazily so
+        # missing augmentation assets do not block model instantiation at test time.
+        from gem.utils.smpl_augment import (
+            get_invisible_legs_mask,
+            get_visible_mask,
+            get_wham_aug_kp3d,
+            randomly_modify_hands_legs,
+        )
+
         target_x = self.endecoder.encode(batch)  # (B, L, C)
         batch["sample_indices_dict"] = self.endecoder.obs_indices_dict
         if mode == "diffusion":

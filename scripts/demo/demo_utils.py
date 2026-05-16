@@ -458,45 +458,22 @@ def render_incam_frames(
     Returns:
         incam_frames: (L, H, W, 3) RGB uint8 composited frames
     """
-    import open3d as o3d
-
-    from gem.utils.vis.o3d_render import Settings, create_meshes
-
-    mat_settings = Settings()
-    lit_mat = mat_settings._materials[Settings.LIT]
-
-    color_incam = torch.tensor([0.69019608, 0.39215686, 0.95686275])
-
-    renderer = o3d.visualization.rendering.OffscreenRenderer(W, H)
-    renderer.scene.set_background([0.0, 0.0, 0.0, 0.0])
-    renderer.scene.set_lighting(
-        renderer.scene.LightingProfile.SOFT_SHADOWS, np.array([0.0, 0.7, 0.7])
-    )
-    renderer.scene.camera.set_projection(
-        K_render.cpu().double().numpy(), 0.01, 100.0, float(W), float(H)
-    )
-    # OpenCV camera convention: camera at origin, looking +Z, Y-down
-    eye = np.array([0.0, 0.0, 0.0])
-    target = np.array([0.0, 0.0, 1.0])
-    up = np.array([0.0, -1.0, 0.0])
-    renderer.scene.camera.look_at(target, eye, up)
+    faces_np = smpl_faces.cpu().numpy().astype(np.int64)
+    K_np = K_render.cpu().numpy().astype(np.float32)
+    color = (176, 100, 244)
 
     incam_frames = []
     for i in tqdm(range(len(frames)), desc="In-camera render", leave=False):
-        mesh = create_meshes(verts_incam[i], smpl_faces, color_incam)
-        mesh_name = f"mesh_{i}"
-        if i > 0:
-            renderer.scene.remove_geometry(f"mesh_{i - 1}")
-        renderer.scene.add_geometry(mesh_name, mesh, lit_mat)
-        rendered = np.array(renderer.render_to_image())  # (H, W, 3) uint8
-        depth = np.asarray(renderer.render_to_depth_image())  # (H, W) float32
-        mask = (depth < 1.0).astype(np.float32)
-        mask = cv2.GaussianBlur(mask, (5, 5), sigmaX=1.0)
-        alpha = mask[..., np.newaxis]
-        composite = rendered.astype(np.float32) * alpha + frames[i].astype(np.float32) * (
-            1.0 - alpha
+        incam_frames.append(
+            _render_mesh_overlay_software(
+                frames[i],
+                verts_incam[i].cpu().numpy().astype(np.float32),
+                faces_np,
+                K_np,
+                color=color,
+                alpha=0.6,
+            )
         )
-        incam_frames.append(composite.clip(0, 255).astype(np.uint8))
 
     return np.stack(incam_frames)
 
@@ -517,19 +494,13 @@ def render_global_frames(
     Returns:
         global_frames: (L, H, W, 3) RGB uint8
     """
-    import open3d as o3d
-
     from gem.utils.cam_utils import create_camera_sensor
-    from gem.utils.vis.o3d_render import Settings, create_meshes, get_ground
     from gem.utils.vis.renderer import (
         get_global_cameras_static_v2,
         get_ground_params_from_points,
     )
 
     L = verts_global.shape[0]
-
-    mat_settings = Settings()
-    lit_mat = mat_settings._materials[Settings.LIT]
 
     # Ground plane parameters
     root_points = verts_global.mean(1)  # (L, 3)
@@ -543,36 +514,107 @@ def render_global_frames(
         cam_height_degree=30,
     )
 
-    renderer = o3d.visualization.rendering.OffscreenRenderer(W, H)
-    renderer.scene.set_background([1.0, 1.0, 1.0, 1.0])
-    renderer.scene.set_lighting(
-        renderer.scene.LightingProfile.NO_SHADOWS, np.array([0.577, -0.577, -0.577])
-    )
-    renderer.scene.camera.set_projection(
-        K_global.cpu().double().numpy(), 0.1, 100.0, float(W), float(H)
-    )
-    renderer.scene.camera.look_at(
-        target_center.cpu().numpy(), position.cpu().numpy(), up_vec.cpu().numpy()
-    )
+    K_global_np = K_global.cpu().numpy().astype(np.float32)
+    faces_np = smpl_faces.cpu().numpy().astype(np.int64)
+    position_np = position.cpu().numpy().astype(np.float32)
+    target_np = target_center.cpu().numpy().astype(np.float32)
+    up_np = up_vec.cpu().numpy().astype(np.float32)
 
-    # Add ground mesh
-    ground = get_ground(max(scale, 3) * 1.5, cx, cz)
-    gv, gf, gc = ground
-    ground_mesh = create_meshes(gv, gf, gc[..., :3])
-    ground_mat = o3d.visualization.rendering.MaterialRecord()
-    ground_mat.shader = Settings.LIT
-    renderer.scene.add_geometry("mesh_ground", ground_mesh, ground_mat)
-
-    color_global = torch.tensor([0.69019608, 0.39215686, 0.95686275])
     global_frames = []
     for i in tqdm(range(L), desc="Global render", leave=False):
-        mesh = create_meshes(verts_global[i], smpl_faces, color_global)
-        if i > 0:
-            renderer.scene.remove_geometry(f"mesh_{i - 1}")
-        renderer.scene.add_geometry(f"mesh_{i}", mesh, lit_mat)
-        global_frames.append(np.array(renderer.render_to_image()))
+        global_frames.append(
+            _render_global_frame_software(
+                verts_global[i].cpu().numpy().astype(np.float32),
+                faces_np,
+                K_global_np,
+                W,
+                H,
+                position_np,
+                target_np,
+                up_np,
+                ground_scale=max(scale, 3) * 1.5,
+                ground_center=(cx, cz),
+            )
+        )
 
     return np.stack(global_frames)
+
+
+def _render_mesh_overlay_software(frame, verts_cam, faces, K, color=(176, 100, 244), alpha=0.6):
+    """Software mesh overlay using simple triangle fill and painter's algorithm."""
+    proj = verts_cam @ K.T
+    z = proj[:, 2:3]
+    z_safe = np.where(z > 1e-2, z, 1e-2)
+    uv = proj[:, :2] / z_safe
+
+    face_pts = uv[faces]
+    face_z = verts_cam[faces, 2]
+    visible = (face_z > 0.1).all(axis=1)
+    if not np.any(visible):
+        return frame.copy()
+
+    face_pts = face_pts[visible]
+    face_z = face_z[visible]
+    order = np.argsort(face_z.mean(axis=1))[::-1]  # far -> near
+    face_pts = face_pts[order].astype(np.int32)
+
+    overlay = frame.copy()
+    for tri in face_pts:
+        cv2.fillConvexPoly(overlay, tri, color, lineType=cv2.LINE_AA)
+    return cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0)
+
+
+def _look_at_world_to_camera(eye, target, up):
+    """Return world->camera matrix for a pinhole camera looking along +Z."""
+    forward = target - eye
+    forward = forward / (np.linalg.norm(forward) + 1e-8)
+    right = np.cross(forward, up)
+    right = right / (np.linalg.norm(right) + 1e-8)
+    down = np.cross(forward, right)
+    down = down / (np.linalg.norm(down) + 1e-8)
+    R = np.stack([right, down, forward], axis=0)
+    t = -R @ eye
+    T = np.eye(4, dtype=np.float32)
+    T[:3, :3] = R
+    T[:3, 3] = t
+    return T
+
+
+def _render_global_frame_software(
+    verts_world,
+    faces,
+    K,
+    width,
+    height,
+    eye,
+    target,
+    up,
+    ground_scale,
+    ground_center,
+):
+    """Software renderer for the global view, independent of OpenGL/EGL."""
+    frame = np.full((height, width, 3), 255, dtype=np.uint8)
+
+    # Draw a simple ground grid in image space.
+    T_wc = _look_at_world_to_camera(eye, target, up)
+    grid_extent = float(ground_scale)
+    cx, cz = ground_center
+    grid_lines = []
+    for v in np.linspace(-grid_extent, grid_extent, 9):
+        grid_lines.append(np.array([[cx + v, 0.0, cz - grid_extent], [cx + v, 0.0, cz + grid_extent]]))
+        grid_lines.append(np.array([[cx - grid_extent, 0.0, cz + v], [cx + grid_extent, 0.0, cz + v]]))
+    for line in grid_lines:
+        pts_h = np.concatenate([line, np.ones((2, 1), dtype=np.float32)], axis=1)
+        pts_cam = (T_wc @ pts_h.T).T[:, :3]
+        if np.any(pts_cam[:, 2] <= 0.05):
+            continue
+        proj = pts_cam @ K.T
+        uv = (proj[:, :2] / proj[:, 2:3]).astype(np.int32)
+        cv2.line(frame, tuple(uv[0]), tuple(uv[1]), (220, 220, 220), 1, cv2.LINE_AA)
+
+    verts_h = np.concatenate([verts_world, np.ones((verts_world.shape[0], 1), dtype=np.float32)], axis=1)
+    verts_cam = (T_wc @ verts_h.T).T[:, :3]
+    return _render_mesh_overlay_software(frame, verts_cam, faces, K, color=(176, 100, 244), alpha=0.9)
 
 
 def normalize_global_verts(body_model, bp_global):
