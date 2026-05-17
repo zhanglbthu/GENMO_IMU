@@ -94,6 +94,7 @@ class SimpleCkptSaver(Checkpoint):
             # Save cureent checkpoint
             filepath = self.output_dir / f"s{trainer.global_step:06d}.ckpt"
             lastpath = self.output_dir / "last.ckpt"
+            Log.info(f"[Simple Ckpt Saver] Saving checkpoint at step={trainer.global_step} -> {filepath}")
             checkpoint = trainer._checkpoint_connector.dump_checkpoint()
             trainer.strategy.save_checkpoint(checkpoint, filepath)
             trainer.strategy.save_checkpoint(checkpoint, lastpath)

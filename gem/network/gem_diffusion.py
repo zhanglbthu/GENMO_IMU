@@ -71,7 +71,6 @@ class GEMDiffusion(nn.Module):
         return
 
     def forward_train(self, inputs, mode):
-        assert self.training, "forward_train should only be called during training"
         diffusion = self.train_diffusion if self.training else self.test_diffusion
         length = inputs["length"]
         # target_x = inputs["target_x"]

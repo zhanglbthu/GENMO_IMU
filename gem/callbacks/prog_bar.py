@@ -95,6 +95,7 @@ class ProgressReporter(ProgressBar, pl.Callback):
     def __init__(
         self,
         log_every_percent: float = 0.1,  # report interval
+        val_log_every_percent: float | None = None,
         exp_name=None,  # if None, use pl_module.exp_name or "Unnamed Experiment"
         data_name=None,  # if None, use pl_module.exp_name or "Unknown Data"
         **kwargs,
@@ -103,6 +104,9 @@ class ProgressReporter(ProgressBar, pl.Callback):
         self.enable = True
         # 1. Store experiment meta data.
         self.log_every_percent = log_every_percent
+        self.val_log_every_percent = (
+            log_every_percent if val_log_every_percent is None else val_log_every_percent
+        )
         self.exp_name = exp_name
         self.data_name = data_name
         self.batch_time_queue = deque(maxlen=5)
@@ -152,6 +156,16 @@ class ProgressReporter(ProgressBar, pl.Callback):
         able = n_finished % log_interval == 0 or n_finished == total
         if log_interval > 10:
             able = able or n_finished in [5, 10]  # always log
+        able = able and self.enable
+        return able
+
+    def _should_update_val(self, n_finished: int, total: int) -> bool:
+        log_interval = max(int(total * self.val_log_every_percent), 1)
+        able = n_finished % log_interval == 0 or n_finished == total
+        if log_interval > 10:
+            able = able or n_finished in [1, 5, 10]
+        else:
+            able = able or n_finished == 1
         able = able and self.enable
         return able
 
@@ -252,6 +266,12 @@ class ProgressReporter(ProgressBar, pl.Callback):
     @rank_zero_only
     def on_validation_epoch_start(self, trainer, pl_module):
         self.time_val_epoch_start = time()
+        total = self.total_val_batches
+        if isinstance(total, list):
+            total = sum(total)
+        Log.info(
+            f"{self.start_prompt}[VAL][Epoch {trainer.current_epoch}] Start validation with {total} batches"
+        )
 
     @rank_zero_only
     def on_validation_batch_end(
@@ -260,7 +280,9 @@ class ProgressReporter(ProgressBar, pl.Callback):
         self.n_finished += 1
         n_finished = self.n_finished
         total = self.total_val_batches
-        if not self._should_update(n_finished, total):
+        if isinstance(total, list):
+            total = sum(total)
+        if not self._should_update_val(n_finished, total):
             return
 
         # General
@@ -282,6 +304,10 @@ class ProgressReporter(ProgressBar, pl.Callback):
         self.print(bar_output)
 
     def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        time_elapsed = time() - self.time_val_epoch_start
+        Log.info(
+            f"{self.finish_prompt}[VAL][Epoch {trainer.current_epoch}] finished! {convert_t_to_str(time_elapsed)}"
+        )
         # Reset
         self.n_finished = 0
 

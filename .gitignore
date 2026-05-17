@@ -18,3 +18,4 @@ scripts/slurm_init.local.sh
 examples/
 .vscode/
 data/
+3rdparty/

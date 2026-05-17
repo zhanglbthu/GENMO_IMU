@@ -1,3 +1,4 @@
 amass_v11:
   _target_: gem.datasets.pure_motion.amass.AmassDataset
+  root: /root/autodl-tmp/dataset/AMASS/hmr4d_support
   cam_augmentation: v11

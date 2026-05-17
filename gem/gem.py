@@ -94,6 +94,7 @@ class GEM(pl.LightningModule):
             "f_cam_angvel": (6,),
             "f_cam_t_vel": (3,),
             "f_imgseq": (1024,),
+            "f_imu": (model_cfg.get("imu_dim", 70),),
             # "encoded_music": 438,
             "encoded_music": (self.pipeline.args.encoded_music_dim,),
             "encoded_audio": (128,),
@@ -106,6 +107,7 @@ class GEM(pl.LightningModule):
             "f_cam_angvel",
             "f_cam_t_vel",
             "f_imgseq",
+            "f_imu",
             "observed_motion_3d",
             "multi_text_embed",
             "encoded_music",
@@ -139,6 +141,12 @@ class GEM(pl.LightningModule):
             self.imgseq_embedder = nn.Sequential(
                 nn.LayerNorm(self.f_condition_dim["f_imgseq"][0]),
                 zero_module(nn.Linear(self.f_condition_dim["f_imgseq"][0], latent_dim)),
+            )
+
+        if "f_imu" in self.pipeline.args.in_attr:
+            self.imu_embedder = nn.Sequential(
+                nn.LayerNorm(self.f_condition_dim["f_imu"][0]),
+                zero_module(nn.Linear(self.f_condition_dim["f_imu"][0], latent_dim)),
             )
 
         if "f_cam_angvel" in self.pipeline.args.in_attr:
@@ -203,7 +211,12 @@ class GEM(pl.LightningModule):
             "camera": ["f_cam_angvel", "f_cam_tvel"],
             "audio": ["encoded_audio"],
             "music": ["encoded_music"],
+            "imu": ["f_imu"],
         }
+        self.uses_visual_conditions = any(
+            key in self.pipeline.args.in_attr
+            for key in ("obs", "f_cliffcam", "f_imgseq", "f_cam_angvel", "f_cam_t_vel")
+        )
 
         if self.model_cfg.normalize_cam_angvel:
             cam_angvel_stats = stats_compose.cam_angvel["manual"]
@@ -405,16 +418,6 @@ class GEM(pl.LightningModule):
         return outputs
 
     def prepare_batch(self, batch, mode):
-        # Training-time observation augmentation depends on external resources
-        # that are not needed for demo/inference-only workflows. Import lazily so
-        # missing augmentation assets do not block model instantiation at test time.
-        from gem.utils.smpl_augment import (
-            get_invisible_legs_mask,
-            get_visible_mask,
-            get_wham_aug_kp3d,
-            randomly_modify_hands_legs,
-        )
-
         target_x = self.endecoder.encode(batch)  # (B, L, C)
         batch["sample_indices_dict"] = self.endecoder.obs_indices_dict
         if mode == "diffusion":
@@ -445,6 +448,42 @@ class GEM(pl.LightningModule):
             batch["encoded_text"] = batch["text_embed"].cuda()
         elif self.use_text_encoder:
             batch["encoded_text"] = self.encode_text(batch["caption"], batch["has_text"])
+
+        if not self.uses_visual_conditions:
+            length = batch["length"]
+            valid = batch["mask"]["valid"]
+            has_imu_mask = batch["mask"].get("has_imu_mask", valid).clone()
+            j2d_visible_mask = torch.zeros(
+                B, L, self.obs_num_joints, dtype=torch.bool, device=batch["target_x"].device
+            )
+            batch["condition_mask"] = {
+                "has_img_mask": torch.zeros_like(valid),
+                "has_2d_mask": torch.zeros_like(valid),
+                "has_cam_mask": torch.zeros_like(valid),
+                "has_audio_mask": batch["mask"]["has_audio_mask"].clone(),
+                "has_music_mask": batch["mask"]["has_music_mask"].clone(),
+                "has_imu_mask": has_imu_mask,
+                "j2d_visible_mask": j2d_visible_mask,
+            }
+            if "static_gt" not in batch:
+                batch["static_gt"] = self.endecoder.get_static_gt(
+                    batch, self.pipeline.args.static_conf.vel_thr
+                )
+            batch["static_gt_mask"] = ~batch["mask"]["invalid_contact"]
+            for k in self.normalizer_stats:
+                if k in batch:
+                    batch[k] = self.normalize_attr(batch[k], k)
+            return
+
+        # Training-time observation augmentation depends on external resources
+        # that are not needed for demo/inference-only workflows. Import lazily so
+        # missing augmentation assets do not block model instantiation at test time.
+        from gem.utils.smpl_augment import (
+            get_invisible_legs_mask,
+            get_visible_mask,
+            get_wham_aug_kp3d,
+            randomly_modify_hands_legs,
+        )
 
         # Create augmented noisy-obs : gt_j3d(coco17)
         with torch.cuda.amp.autocast(enabled=False):
@@ -541,6 +580,9 @@ class GEM(pl.LightningModule):
         condition_mask["has_cam_mask"] = batch["mask"]["has_cam_mask"].clone()
         condition_mask["has_audio_mask"] = batch["mask"]["has_audio_mask"].clone()
         condition_mask["has_music_mask"] = batch["mask"]["has_music_mask"].clone()
+        condition_mask["has_imu_mask"] = batch["mask"].get(
+            "has_imu_mask", torch.zeros_like(condition_mask["has_img_mask"])
+        ).clone()
         batch["condition_mask"] = condition_mask
 
         obs_kp2d = torch.cat(
@@ -579,6 +621,7 @@ class GEM(pl.LightningModule):
         has_cam_mask = condition_mask["has_cam_mask"].clone()
         has_audio_mask = condition_mask["has_audio_mask"].clone()
         has_music_mask = condition_mask["has_music_mask"].clone()
+        has_imu_mask = condition_mask.get("has_imu_mask", torch.zeros_like(has_img_mask)).clone()
         j2d_visible_mask = condition_mask["j2d_visible_mask"].clone()
 
         if train:
@@ -586,6 +629,7 @@ class GEM(pl.LightningModule):
             mask_text_prob = cond_mask_cfg.get("mask_text_prob", {}).get(mode, 0.0)
             mask_img_prob = cond_mask_cfg.get("mask_img_prob", 0.0)
             mask_cam_prob = cond_mask_cfg.get("mask_cam_prob", 0.0)
+            mask_imu_prob = cond_mask_cfg.get("mask_imu_prob", 0.0)
             mask_f_imgseq_prob = cond_mask_cfg.get("mask_f_imgseq_prob", 0.0)
 
             if mask_text_prob > 0:
@@ -615,6 +659,10 @@ class GEM(pl.LightningModule):
                 ).to(device)[:, None]
                 has_cam_mask = has_cam_mask & ~mask_cam
 
+            if mask_imu_prob > 0:
+                mask_imu = (torch.rand(batch["B"], device=device) < mask_imu_prob)[:, None]
+                has_imu_mask = has_imu_mask & ~mask_imu
+
             has_music_mask = (
                 has_music_mask & (torch.rand((B,), device=device) > self.music_mask_prob)[:, None]
             )
@@ -640,6 +688,8 @@ class GEM(pl.LightningModule):
             f_condition_exists[k] = has_audio_mask.clone()
         for k in self.condition_source["music"]:
             f_condition_exists[k] = has_music_mask.clone()
+        for k in self.condition_source["imu"]:
+            f_condition_exists[k] = has_imu_mask.clone()
 
         if train and mask_f_imgseq_prob > 0:
             mask_f_imgseq = (torch.rand(batch["B"]) < mask_f_imgseq_prob).to(device)
@@ -715,6 +765,13 @@ class GEM(pl.LightningModule):
                 f_cond_dict["f_imgseq"] = f_imgseq * mask.float()
                 f_uncond_dict["f_imgseq"] = f_imgseq * mask.float()
                 f_empty_dict["f_imgseq"] = torch.zeros_like(f_imgseq)
+            elif k == "f_imu":
+                f_imu = batch["f_imu"][:, :end_fr]
+                f_imu = self.imu_embedder(f_imu)
+                mask = f_condition_exists[k][:, :, None]
+                f_cond_dict["f_imu"] = f_imu * mask.float()
+                f_uncond_dict["f_imu"] = f_imu * mask.float()
+                f_empty_dict["f_imu"] = torch.zeros_like(f_imu)
             elif k == "encoded_music":
                 if "music_embed" in batch:
                     f_encoded_music = batch["music_embed"][:, :end_fr]  # (B, L, C)
@@ -846,8 +903,49 @@ class GEM(pl.LightningModule):
         return outputs
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
+        if self.model_cfg.get("validation_loss_only", False):
+            return self.validation_loss_step(batch, batch_idx, dataloader_idx)
         test_mode = batch["meta"][0].get("mode", "default")
         return self.validation(batch, test_mode, batch_idx, dataloader_idx)
+
+    def validation_loss_step(self, batch, batch_idx, dataloader_idx=0):
+        outputs = {"loss": 0.0, "batch_size": batch["B"]}
+
+        for mode in self.train_modes:
+            self.prepare_batch(batch, mode)
+            batch_mode = batch.copy()
+            for k, v in batch_mode.items():
+                if isinstance(v, torch.Tensor):
+                    batch_mode[k] = v.detach().clone()
+            batch_mode = self.create_condition_mask(
+                batch_mode, cond_mask_cfg=None, mode=mode, train=False
+            )
+            outputs_mode = self.pipeline.forward(
+                batch_mode,
+                train=True,
+                global_step=self.trainer.global_step if self.trainer is not None else 0,
+                mode=mode,
+                normalizer_stats=self.normalizer_stats,
+            )
+            outputs["loss"] += outputs_mode["loss"].detach()
+            if mode == "regression" and "diffusion" in self.train_modes:
+                batch["regression_outputs"] = outputs_mode.copy()
+            for k, v in list(outputs_mode.items()):
+                if "_loss" in k or k == "loss":
+                    outputs[f"val_{mode}/{k}"] = v.detach()
+
+        log_kwargs = {
+            "on_epoch": True,
+            "prog_bar": True,
+            "logger": True,
+            "sync_dist": True,
+            "batch_size": outputs["batch_size"],
+        }
+        self.log("val/loss", outputs["loss"], **log_kwargs)
+        for k, v in outputs.items():
+            if k.startswith("val_"):
+                self.log(k, v, **log_kwargs)
+        return outputs
 
     def validation(self, batch, test_mode, batch_idx, dataloader_idx=0):
         # Ensure endecoder indices are built (may not be if running test-only)
@@ -896,6 +994,8 @@ class GEM(pl.LightningModule):
             "mask": batch["mask"],
             "sample_indices_dict": self.endecoder.obs_indices_dict,
         }
+        if "f_imu" in batch:
+            batch_["f_imu"] = batch["f_imu"]
         if "music_embed" in batch:
             batch_["music_embed"] = batch["music_embed"]
         if "audio_array" in batch:
@@ -912,6 +1012,9 @@ class GEM(pl.LightningModule):
         condition_mask["has_cam_mask"] = batch["mask"]["has_cam_mask"].clone()
         condition_mask["has_audio_mask"] = batch["mask"]["has_audio_mask"].clone()
         condition_mask["has_music_mask"] = batch["mask"]["has_music_mask"].clone()
+        condition_mask["has_imu_mask"] = batch["mask"].get(
+            "has_imu_mask", torch.zeros_like(batch["mask"]["has_img_mask"])
+        ).clone()
         condition_mask["j2d_visible_mask"] = j2d_visible_mask
         batch_["condition_mask"] = condition_mask
 
@@ -1103,6 +1206,13 @@ class GEM(pl.LightningModule):
         test_mode = data["meta"][0].get("mode", "default")
         if self.endecoder.obs_indices_dict is None:
             self.endecoder.build_obs_indices_dict()
+        cond_source = data.get("f_imgseq", data.get("f_imu", data["kp2d"]))
+        seq_len = cond_source.shape[0]
+        has_text = data.get("has_text", torch.tensor([False]))
+        if not isinstance(has_text, torch.Tensor):
+            has_text = torch.tensor([bool(has_text)])
+        elif has_text.ndim == 0:
+            has_text = has_text[None]
         batch = {
             "length": data["length"][None].cuda(),
             "obs": normalize_kp2d(data["kp2d"], data["bbx_xys"])[None].cuda(),
@@ -1111,18 +1221,21 @@ class GEM(pl.LightningModule):
             "cam_angvel": data["cam_angvel"][None].cuda(),
             "f_cam_angvel": data["cam_angvel"][None].cuda(),
             "cam_tvel": data["cam_tvel"][None].cuda(),
-            "R_w2c": data["R_w2c"][None].cuda(),
             "f_imgseq": data["f_imgseq"][None].cuda(),
             # "text_embed": data["text_embed"][None].cuda(),
-            "has_text": data["has_text"].cuda(),
+            "has_text": has_text.cuda(),
             "B": 1,
-            "L": data["f_imgseq"].shape[0],
+            "L": seq_len,
             "mode": test_mode,
             "target_x": torch.zeros(
-                1, data["f_imgseq"].shape[0], self.endecoder.get_motion_dim()
+                1, seq_len, self.endecoder.get_motion_dim()
             ).cuda(),
             "sample_indices_dict": self.endecoder.obs_indices_dict,
         }
+        if "R_w2c" in data:
+            batch["R_w2c"] = data["R_w2c"][None].cuda()
+        if "f_imu" in data:
+            batch["f_imu"] = data["f_imu"][None].cuda()
         if "music_embed" in data:
             batch["music_embed"] = data["music_embed"][None].cuda()
         if "audio_array" in data:
@@ -1144,7 +1257,7 @@ class GEM(pl.LightningModule):
                 batch["caption"] = [data["caption"]]
             else:
                 batch["caption"] = [""]
-            batch["has_text"] = torch.tensor([True])
+            batch["has_text"] = has_text
             batch["encoded_text"] = self.encode_text(batch["caption"], batch["has_text"])
 
         batch["f_cliffcam"] = compute_bbox_info_bedlam(batch["bbx_xys"], batch["K_fullimg"]).cuda()
@@ -1155,6 +1268,9 @@ class GEM(pl.LightningModule):
         condition_mask["has_cam_mask"] = data["mask"]["has_cam_mask"][None].cuda().clone()
         condition_mask["has_audio_mask"] = data["mask"]["has_audio_mask"][None].cuda().clone()
         condition_mask["has_music_mask"] = data["mask"]["has_music_mask"][None].cuda().clone()
+        condition_mask["has_imu_mask"] = data["mask"].get(
+            "has_imu_mask", torch.zeros_like(data["mask"]["has_img_mask"])
+        )[None].cuda().clone()
         kp2d_conf = data["kp2d"][..., 2][None].cuda()
         condition_mask["j2d_visible_mask"] = kp2d_conf > 0.5
         batch["condition_mask"] = condition_mask
@@ -1193,11 +1309,15 @@ class GEM(pl.LightningModule):
         )
 
         pred = {
-            "body_params_global": {k: v[0] for k, v in outputs["pred_body_params_global"].items()},
-            "body_params_incam": {k: v[0] for k, v in outputs["pred_body_params_incam"].items()},
-            "K_fullimg": data["K_fullimg"],
             "net_outputs": outputs,  # intermediate outputs
         }
+        if "pred_body_params_global" in outputs:
+            pred["body_params_global"] = {
+                k: v[0] for k, v in outputs["pred_body_params_global"].items()
+            }
+        if "pred_body_params_incam" in outputs:
+            pred["body_params_incam"] = {k: v[0] for k, v in outputs["pred_body_params_incam"].items()}
+            pred["K_fullimg"] = data["K_fullimg"]
         print(f"Demo taken: {time.time() - now}")
         return pred
 

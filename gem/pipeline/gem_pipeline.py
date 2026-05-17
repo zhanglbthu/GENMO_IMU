@@ -84,7 +84,11 @@ class Pipeline(nn.Module):
         outputs.update({"model_output": model_output, "decode_dict": decode_dict})
 
         # Post-processing``
-        if "body_pose" in decode_dict and "global_orient" in decode_dict:
+        if (
+            "body_pose" in decode_dict
+            and "global_orient" in decode_dict
+            and model_output.get("pred_cam", None) is not None
+        ):
             pred_body_params_incam = {
                 "body_pose": decode_dict["body_pose"],  # (B, L, 63)
                 "global_orient": decode_dict["global_orient"],  # (B, L, 3)
