@@ -1,11 +1,11 @@
 amass_imu:
   _target_: gem.datasets.pure_motion.amass_imu.IMUAmassDataset
-  root: /root/autodl-tmp/dataset/AMASS/hmr4d_support
+  root: null
   split: train
   val_ratio: 0.1
   split_seed: 1234
   use_processed: true
-  processed_root: /root/autodl-tmp/dataset/AMASS/hmr4d_support/processed
+  processed_root: /root/autodl-tmp/dataset/processed
   motion_frames: ${data.dataset_opts.max_motion_frames}
   window_stride: ${data.dataset_opts.max_motion_frames}
   interpolate_to_motion_frames: false

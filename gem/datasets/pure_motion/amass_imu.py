@@ -1,10 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+import os
 import numpy as np
 import torch
 import torch.nn.functional as F
 from einops import rearrange
+from pathlib import Path
 from torch.utils.data import Dataset
+from tqdm import tqdm
 
 from gem.utils.net_utils import get_valid_mask, repeat_to_max_len, repeat_to_max_len_dict
 from gem.utils.rotation_conversions import axis_angle_to_matrix, matrix_to_axis_angle, matrix_to_rotation_6d, rotation_6d_to_matrix
@@ -53,17 +56,30 @@ class IMUAmassDataset(AmassMotionMixin, Dataset):
         use_cache=True,
     ):
         Dataset.__init__(self)
-        AmassMotionMixin.__init__(
-            self,
-            motion_frames=motion_frames,
-            l_factor=l_factor,
-            skip_moyo=skip_moyo,
-            random1024=random1024,
-            root=root,
-            split=split,
-            val_ratio=val_ratio,
-            split_seed=split_seed,
-        )
+        self.use_processed = use_processed
+        self.processed_root = processed_root
+        if self.use_processed:
+            self.root = Path(processed_root).expanduser()
+            self.motion_frames = motion_frames
+            self.l_factor = l_factor
+            self.random1024 = random1024
+            self.skip_moyo = skip_moyo
+            self.dataset_name = "AMASS"
+            self.split = split
+            self.val_ratio = float(val_ratio)
+            self.split_seed = int(split_seed)
+        else:
+            AmassMotionMixin.__init__(
+                self,
+                motion_frames=motion_frames,
+                l_factor=l_factor,
+                skip_moyo=skip_moyo,
+                random1024=random1024,
+                root=root,
+                split=split,
+                val_ratio=val_ratio,
+                split_seed=split_seed,
+            )
         self.limit_size = limit_size
         self.augment_betas_std = augment_betas_std
         self.rotate_y_aug = rotate_y_aug
@@ -72,8 +88,6 @@ class IMUAmassDataset(AmassMotionMixin, Dataset):
         self.include_combo_mask = include_combo_mask
         self.window_stride = motion_frames if window_stride is None else int(window_stride)
         self.interpolate_to_motion_frames = interpolate_to_motion_frames
-        self.use_processed = use_processed
-        self.processed_root = processed_root
         self.cache_dir = cache_dir
         self.use_cache = use_cache
         self.sensor_combos = {k: list(v) for k, v in DEFAULT_SENSOR_COMBOS.items()}
@@ -95,9 +109,6 @@ class IMUAmassDataset(AmassMotionMixin, Dataset):
         if not self.use_processed:
             return AmassMotionMixin._load_dataset(self)
 
-        import os
-        from pathlib import Path
-
         processed_root = Path(self.processed_root).expanduser()
         if not processed_root.exists():
             raise FileNotFoundError(f"Processed AMASS root not found: {processed_root}")
@@ -112,7 +123,7 @@ class IMUAmassDataset(AmassMotionMixin, Dataset):
         self.processed_seq_meta = []
         tic = Log.time()
         Log.info(f"[AMASS processed] Loading from {processed_root} ...")
-        for file_path in files:
+        for file_path in tqdm(files):
             ds_name = os.path.splitext(file_path.name)[0]
             ds = torch.load(file_path, map_location="cpu")
             self.processed_data[ds_name] = ds

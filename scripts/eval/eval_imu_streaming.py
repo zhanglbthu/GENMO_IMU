@@ -20,11 +20,11 @@ from gem.utils.rotation_conversions import axis_angle_to_matrix
 
 WINDOW_FRAMES = 120
 IMUPOSER_DEVICE_TO_SLOT = {
-    0: 2,  # left phone -> left thigh / pocket
-    1: 0,  # left watch -> left wrist
-    2: 4,  # headphone -> head
+    0: 0,  # left wrist
+    1: 1,  # right wrist
+    2: 2,  # left phone -> left thigh / pocket
     3: 3,  # right phone -> right thigh / pocket
-    4: 1,  # right watch -> right wrist
+    4: 4,  # head
 }
 
 
@@ -38,7 +38,7 @@ def parse_args():
     parser.add_argument(
         "--eval-pt",
         type=str,
-        default="/root/autodl-tmp/dataset/AMASS/hmr4d_support/processed/eval/imuposer_test.pt",
+        default="/root/autodl-tmp/dataset/processed/eval/imuposer_test.pt",
     )
     parser.add_argument("--exp", type=str, default="gem_imu")
     parser.add_argument("--combo", type=str, default="lw_rp_h")
