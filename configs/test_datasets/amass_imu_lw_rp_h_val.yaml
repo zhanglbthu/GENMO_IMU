@@ -1,0 +1,22 @@
+amass_imu_lw_rp_h_val:
+  _target_: gem.datasets.pure_motion.amass_imu.IMUAmassDataset
+  root: null
+  split: val
+  val_ratio: 0.1
+  split_seed: 1234
+  use_processed: true
+  processed_root: /root/autodl-tmp/dataset/processed
+  motion_frames: ${data.dataset_opts.max_motion_frames}
+  window_stride: ${data.dataset_opts.max_motion_frames}
+  interpolate_to_motion_frames: false
+  l_factor: 1.5
+  smooth_n: 4
+  augment_betas_std: 0.0
+  use_cache: false
+  cache_dir: /root/autodl-tmp/dataset/processed/genmo/amass_imu_cache_v1
+  direct_combo_features: true
+  direct_rotation_rep: mat9
+  include_combo_mask: false
+  sample_combo: false
+  combo_names:
+    - lw_rp_h

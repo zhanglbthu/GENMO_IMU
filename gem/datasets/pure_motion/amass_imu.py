@@ -22,6 +22,7 @@ from .imu_utils import (
     IMU_JOINT_IDS,
     IMU_VERT_IDS,
     build_f_imu,
+    build_f_imu_selected,
     cache_file_for_sequence,
     compute_sequence_imu,
     load_smpl_models,
@@ -45,6 +46,8 @@ class IMUAmassDataset(AmassMotionMixin, Dataset):
         combo_names=None,
         sample_combo=True,
         include_combo_mask=True,
+        direct_combo_features=False,
+        direct_rotation_rep="mat9",
         window_stride=None,
         interpolate_to_motion_frames=False,
         split="train",
@@ -86,6 +89,8 @@ class IMUAmassDataset(AmassMotionMixin, Dataset):
         self.smooth_n = smooth_n
         self.sample_combo = sample_combo
         self.include_combo_mask = include_combo_mask
+        self.direct_combo_features = direct_combo_features
+        self.direct_rotation_rep = direct_rotation_rep
         self.window_stride = motion_frames if window_stride is None else int(window_stride)
         self.interpolate_to_motion_frames = interpolate_to_motion_frames
         self.cache_dir = cache_dir
@@ -214,6 +219,8 @@ class IMUAmassDataset(AmassMotionMixin, Dataset):
 
     def _apply_sensor_combo(self, imu_acc, imu_rot):
         combo_name, sensor_mask = self._choose_combo()
+        if self.direct_combo_features:
+            return imu_acc, imu_rot, combo_name, sensor_mask
         imu_acc = imu_acc.clone()
         imu_rot = imu_rot.clone()
         imu_acc[:, ~sensor_mask] = 0
@@ -277,12 +284,28 @@ class IMUAmassDataset(AmassMotionMixin, Dataset):
             "transl": data["transl"].clone(),
         }
         smpl_params_c = {k: v.clone() for k, v in smpl_params_w.items()}
-        imu_sensor_mask = sensor_mask.float().unsqueeze(0).repeat(length, 1)
-        f_imu, imu_rot6d = build_f_imu(
-            imu_acc, imu_rot, sensor_mask.float(), include_combo_mask=self.include_combo_mask
-        )
-        if self.include_combo_mask:
-            pass
+        if self.direct_combo_features:
+            sensor_ids = sensor_mask.nonzero(as_tuple=False).flatten().tolist()
+            f_imu, imu_acc_sel, imu_rot_sel, imu_rot_feat = build_f_imu_selected(
+                imu_acc,
+                imu_rot,
+                sensor_ids,
+                rotation_rep=self.direct_rotation_rep,
+            )
+            imu_sensor_mask = torch.ones(len(sensor_ids), dtype=torch.float32)
+            imu_signal_mask = imu_sensor_mask.unsqueeze(0).repeat(length, 1)
+            imu_sensor_vertex_ids = IMU_VERT_IDS[sensor_mask].clone()
+            imu_sensor_joint_ids = IMU_JOINT_IDS[sensor_mask].clone()
+        else:
+            imu_sensor_mask = sensor_mask.float().unsqueeze(0).repeat(length, 1)
+            f_imu, imu_rot_feat = build_f_imu(
+                imu_acc, imu_rot, sensor_mask.float(), include_combo_mask=self.include_combo_mask
+            )
+            imu_acc_sel = imu_acc
+            imu_rot_sel = imu_rot
+            imu_signal_mask = imu_sensor_mask
+            imu_sensor_vertex_ids = IMU_VERT_IDS.clone()
+            imu_sensor_joint_ids = IMU_JOINT_IDS.clone()
         has_imu_mask = get_valid_mask(length, length)
 
         return {
@@ -307,14 +330,14 @@ class IMUAmassDataset(AmassMotionMixin, Dataset):
             "cam_tvel": torch.zeros((length, 3), dtype=torch.float32),
             "noisy_cam_tvel": torch.zeros((length, 3), dtype=torch.float32),
             "T_w2c": repeat_to_max_len(T_w2c, length),
-            "imu_acc": imu_acc,
-            "imu_rot": imu_rot,
-            "imu_rot6d": imu_rot6d,
-            "imu_sensor_mask": sensor_mask.float(),
-            "imu_signal_mask": imu_sensor_mask,
+            "imu_acc": imu_acc_sel,
+            "imu_rot": imu_rot_sel,
+            "imu_rot_feat": imu_rot_feat,
+            "imu_sensor_mask": imu_sensor_mask,
+            "imu_signal_mask": imu_signal_mask,
             "f_imu": f_imu,
-            "imu_sensor_vertex_ids": IMU_VERT_IDS.clone(),
-            "imu_sensor_joint_ids": IMU_JOINT_IDS.clone(),
+            "imu_sensor_vertex_ids": imu_sensor_vertex_ids,
+            "imu_sensor_joint_ids": imu_sensor_joint_ids,
             "mask": {
                 "valid": get_valid_mask(length, length),
                 "humanoid": get_valid_mask(length, 0),

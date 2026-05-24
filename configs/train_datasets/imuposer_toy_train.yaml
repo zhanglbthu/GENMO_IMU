@@ -1,0 +1,7 @@
+imuposer_toy_train:
+  _target_: gem.datasets.pure_motion.imuposer_toy.IMUPoserToyDataset
+  data_path: /root/autodl-tmp/dataset/processed/eval/imuposer_toy_multimodal_train.pt
+  motion_frames: ${data.dataset_opts.max_motion_frames}
+  window_stride: ${data.dataset_opts.max_motion_frames}
+  combo_name: lw_rp_h
+  rotate_y_aug: true

@@ -103,6 +103,21 @@ def build_f_imu(imu_acc, imu_rot, sensor_mask, include_combo_mask=True):
     return torch.cat(parts, dim=-1), imu_rot6d
 
 
+def build_f_imu_selected(imu_acc, imu_rot, sensor_ids, rotation_rep="mat9"):
+    sensor_ids = list(sensor_ids)
+    imu_acc_sel = imu_acc[:, sensor_ids]
+    imu_rot_sel = imu_rot[:, sensor_ids]
+    parts = [imu_acc_sel.reshape(imu_acc_sel.shape[0], -1)]
+    if rotation_rep == "mat9":
+        imu_rot_feat = imu_rot_sel.reshape(imu_rot_sel.shape[0], -1)
+    elif rotation_rep == "rot6d":
+        imu_rot_feat = matrix_to_rotation_6d(imu_rot_sel).reshape(imu_rot_sel.shape[0], -1)
+    else:
+        raise ValueError(f"Unsupported rotation_rep: {rotation_rep}")
+    parts.append(imu_rot_feat)
+    return torch.cat(parts, dim=-1), imu_acc_sel, imu_rot_sel, imu_rot_feat
+
+
 def cache_file_for_sequence(cache_dir, seq_name):
     cache_dir = Path(cache_dir)
     digest = hashlib.sha1(seq_name.encode("utf-8")).hexdigest()

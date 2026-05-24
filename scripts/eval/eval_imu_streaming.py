@@ -13,8 +13,10 @@ import numpy as np
 import torch
 from hydra.utils import instantiate
 from tqdm import tqdm
+from scripts.eval.aitviewer_render import render_smpl_side_by_side_aitviewer
 
 from gem.datasets.pure_motion.imu_utils import DEFAULT_SENSOR_COMBOS, build_f_imu
+from gem.utils.motion_utils import init_rollout_w_Rt_state, rollout_step_w_Rt
 from gem.utils.rotation_conversions import axis_angle_to_matrix
 
 
@@ -165,22 +167,15 @@ def map_imuposer_to_f_imu(acc5, ori5, combo_name):
     length = acc5.shape[0]
     acc7 = torch.zeros(length, 7, 3, dtype=torch.float32)
     ori7 = torch.eye(3, dtype=torch.float32).view(1, 1, 3, 3).repeat(length, 7, 1, 1)
-    available = torch.zeros(7, dtype=torch.float32)
-
     for src_idx, dst_idx in IMUPOSER_DEVICE_TO_SLOT.items():
         acc7[:, dst_idx] = acc5[:, src_idx]
         ori7[:, dst_idx] = ori5[:, src_idx]
-        available[dst_idx] = 1.0
-
     sensor_mask = torch.zeros(7, dtype=torch.float32)
     sensor_mask[DEFAULT_SENSOR_COMBOS[combo_name]] = 1.0
-    sensor_mask = sensor_mask * available
-
     for slot_idx in range(7):
         if sensor_mask[slot_idx] == 0:
             acc7[:, slot_idx] = 0
             ori7[:, slot_idx] = 0
-
     f_imu, _ = build_f_imu(acc7, ori7, sensor_mask, include_combo_mask=True)
     return f_imu, sensor_mask
 
@@ -222,7 +217,7 @@ def make_window_data(f_imu_window, sensor_mask):
 
 
 @torch.no_grad()
-def predict_window_batch(model, windows, sensor_mask):
+def decode_window_batch(model, windows, sensor_mask):
     from gem.utils.cam_utils import compute_bbox_info_bedlam
     from gem.utils.geo_transform import normalize_kp2d
 
@@ -288,10 +283,19 @@ def predict_window_batch(model, windows, sensor_mask):
         static_cam=True,
         test_mode="default",
     )
-    body = outputs["pred_body_params_global"]
-    pose_p = body_params_to_full_pose(body["body_pose"][:, -1], body["global_orient"][:, -1]).cpu()
-    tran_p = body.get("transl", torch.zeros(B, L, 3, device=device))[:, -1].detach().cpu()
-    return pose_p, tran_p
+    decode = outputs["decode_dict"]
+    result = {
+        "body_pose": decode["body_pose"][:, -1].detach().cpu(),
+        "global_orient_c": decode["global_orient"][:, -1].detach().cpu(),
+        "global_orient_gv": decode["global_orient_gv"][:, -1].detach().cpu(),
+        "local_transl_vel_curr": decode["local_transl_vel"][:, -1].detach().cpu(),
+        "local_transl_vel_prev": (
+            decode["local_transl_vel"][:, -2].detach().cpu() if L > 1 else None
+        ),
+    }
+    if "betas" in decode:
+        result["betas"] = decode["betas"][:, -1].detach().cpu()
+    return result
 
 
 @torch.no_grad()
@@ -299,6 +303,7 @@ def stream_predict_sequence(model, f_imu_seq, sensor_mask, window, batch_size=16
     pred_pose = []
     pred_tran = []
     windows = []
+    rollout_state = None
     for frame_idx in range(f_imu_seq.shape[0]):
         left = max(0, frame_idx - window + 1)
         chunk = f_imu_seq[left : frame_idx + 1]
@@ -310,9 +315,32 @@ def stream_predict_sequence(model, f_imu_seq, sensor_mask, window, batch_size=16
     for start in tqdm(range(0, len(windows), batch_size), leave=False):
         batch_windows = torch.stack(windows[start : start + batch_size], dim=0)
         with contextlib.redirect_stdout(io.StringIO()):
-            pose_batch, tran_batch = predict_window_batch(model, batch_windows, sensor_mask)
-        pred_pose.extend([x for x in pose_batch])
-        pred_tran.extend([x for x in tran_batch])
+            decoded = decode_window_batch(model, batch_windows, sensor_mask)
+        chunk_size = batch_windows.shape[0]
+        for i in range(chunk_size):
+            gv_curr = decoded["global_orient_gv"][i]
+            gc_curr = decoded["global_orient_c"][i]
+            lv_prev = decoded["local_transl_vel_prev"][i] if decoded["local_transl_vel_prev"] is not None else None
+            lv_curr = decoded["local_transl_vel_curr"][i]
+            if rollout_state is None:
+                rollout_state = init_rollout_w_Rt_state(
+                    gv_curr.cuda(), gc_curr.cuda(), device=model.device
+                )
+            body_params_global, rollout_state = rollout_step_w_Rt(
+                rollout_state,
+                global_orient_gv_curr=gv_curr.cuda(),
+                global_orient_c_curr=gc_curr.cuda(),
+                cam_angvel_prev=None,
+                local_transl_vel_prev=(lv_prev.cuda() if lv_prev is not None else None),
+                local_transl_vel_curr=(None if lv_prev is not None else lv_curr.cuda()),
+            )
+            pose_frame = body_params_to_full_pose(
+                decoded["body_pose"][i].cuda(),
+                body_params_global["global_orient"][0],
+            ).cpu()[0]
+            transl_frame = body_params_global["transl"][0].detach().cpu()
+            pred_pose.append(pose_frame)
+            pred_tran.append(transl_frame)
     return torch.stack(pred_pose), torch.stack(pred_tran)
 
 
@@ -339,7 +367,22 @@ def skeleton_to_image(joints, parents, image_wh=(960, 540), color=(50, 90, 220))
 
 
 @torch.no_grad()
-def render_side_by_side(body_model, pose_t, tran_t, pose_p, tran_p, output_path, fps=30):
+def render_side_by_side(body_model, pose_t, tran_t, pose_p, tran_p, output_path, fps=30, backend="aitviewer"):
+    if backend == "aitviewer":
+        try:
+            render_smpl_side_by_side_aitviewer(
+                body_model,
+                pose_t,
+                tran_t,
+                pose_p,
+                tran_p,
+                output_path=output_path,
+                fps=fps,
+            )
+            return
+        except Exception as exc:
+            print(f"[AITViewer render fallback] {exc}")
+
     _, gt_joints = body_model.forward_kinematics(pose_t, tran=tran_t, calc_mesh=False)
     _, pred_joints = body_model.forward_kinematics(pose_p, tran=tran_p, calc_mesh=False)
     gt_joints = gt_joints.cpu().numpy()
